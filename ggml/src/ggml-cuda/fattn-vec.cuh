@@ -379,6 +379,10 @@ static __global__ void flash_attn_ext_vec(
             }
 #endif // V_DOT2_F32_F16_AVAILABLE
         }
+
+#ifndef GGML_USE_HIP
+        __syncwarp(); // WAR: the next iteration's KQ write must not race these VKQ reads (upstream #30573).
+#endif // GGML_USE_HIP
     }
 
     if (sinks && blockIdx.y == 0) {

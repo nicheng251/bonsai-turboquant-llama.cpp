@@ -2228,7 +2228,7 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
         kv_self->set_input_k_shift(k_shift);
     }
 
-    if (k_rot) {
+    if (k_rot && k_rot->buffer) { // upstream #27967: k_rot has no buffer for an unquantized K cache
         kv_self->set_input_k_rot(k_rot);
     }
 }
