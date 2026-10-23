@@ -5,11 +5,40 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16>
+#include <cstdlib>
+
+// 0 = force the FP16 conversion path, 1 = native (default), 2 = native plus the vector-kernel fallback.
+static int ggml_cuda_turbo_fa_mode() {
+    static const int mode = [] {
+        const char * value = std::getenv("GGML_CUDA_TURBO_FA");
+        if (value == nullptr || value[0] == '\0') {
+            return 1;
+        }
+        if (value[0] == '0') {
+            return 0;
+        }
+        if (value[0] == '1') {
+            return 2;
+        }
+        return 1;
+    }();
+    return mode;
+}
+
+
+template <int DKQ, int DV, int ncols2, ggml_type type_KV = GGML_TYPE_F16, ggml_type type_V = type_KV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * V = dst->src[2];
+
+    if constexpr (ggml_cuda_fattn_mma_is_turbo(type_KV) || ggml_cuda_fattn_mma_is_turbo(type_V)) {
+        // TurboQuant dequantizes into shared memory per tile; only the 8-column tiling is instantiated.
+        // Prefill (more query rows) converts to F16: attention is <2% of prefill even at 17K context,
+        // so extra tilings cost compile time without a measurable gain.
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_KV, type_V>(ctx, dst);
+        return;
+    }
 
     if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
         ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
@@ -18,28 +47,28 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
 
     if constexpr (ncols2 <= 8) {
         if (turing_mma_available(cc) && Q->ne[1] <= 8/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 8/ncols2, ncols2, type_KV, type_V>(ctx, dst);
             return;
         }
     }
 
     if constexpr (ncols2 <= 16) {
         if (Q->ne[1] <= 16/ncols2) {
-            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 16/ncols2, ncols2, type_KV, type_V>(ctx, dst);
             return;
         }
     }
 
     if (Q->ne[1] <= 32/ncols2 || (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_TURING) ||
             (GGML_CUDA_CC_IS_AMD(cc) && DKQ > 256)) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 32/ncols2, ncols2, type_KV, type_V>(ctx, dst);
         return;
     }
 
-    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV>(ctx, dst);
+    ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV, type_V>(ctx, dst);
 }
 
-template <int DKQ, int DV, ggml_type type_KV = GGML_TYPE_F16>
+template <int DKQ, int DV, ggml_type type_KV = GGML_TYPE_F16, ggml_type type_V = type_KV>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -72,22 +101,22 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     // On Volta the GQA optimizations aren't as impactful vs. minimizing wasted compute:
     if (cc == GGML_CUDA_CC_VOLTA) {
         if (use_gqa_opt && gqa_ratio % 8 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV, type_V>(ctx, dst);
             return;
         }
 
         if (use_gqa_opt && gqa_ratio % 4 == 0) {
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_KV, type_V>(ctx, dst);
             return;
         }
 
         if constexpr (DKQ <= 256) {
             if (use_gqa_opt && gqa_ratio % 2 == 0) {
-                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV, type_V>(ctx, dst);
                 return;
             }
 
-            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_KV>(ctx, dst);
+            ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_KV, type_V>(ctx, dst);
             return;
         } else {
             GGML_ABORT("fatal error");
@@ -95,25 +124,60 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 
     if (use_gqa_opt && gqa_ratio > 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8, type_KV, type_V>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 2) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_KV>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4, type_KV, type_V>(ctx, dst);
         return;
     }
 
     if (use_gqa_opt && gqa_ratio > 1) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2, type_KV, type_V>(ctx, dst);
         return;
     }
 
     if constexpr (DKQ <= 256) {
-        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_KV>(ctx, dst);
+        ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 1, type_KV, type_V>(ctx, dst);
     } else {
         GGML_ABORT("fatal error");
     }
+}
+
+// Native TurboQuant KV on the MMA path. Only these pairs are instantiated, always with an 8-column tiling.
+static bool ggml_cuda_fattn_mma_turbo_supported(const ggml_tensor * K, const ggml_tensor * V) {
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc)) {
+        return false;
+    }
+    if (K->ne[0] != V->ne[0] || (K->ne[0] != 128 && K->ne[0] != 256)) {
+        return false;
+    }
+    const bool k_ok = K->type == GGML_TYPE_Q8_0 || ggml_cuda_fattn_mma_is_turbo(K->type);
+    const bool v_ok = ggml_cuda_fattn_mma_is_turbo(V->type);
+    return k_ok && v_ok && ggml_cuda_is_aligned(K, 4) && ggml_cuda_is_aligned(V, 4);
+}
+
+static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+#define FATTN_TURBO_PAIR(tK_, tV_)                                                                          \
+    if (K->type == tK_ && V->type == tV_) {                                                                 \
+        if (K->ne[0] == 128) { ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, tK_, tV_>(ctx, dst); } \
+        else                 { ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, tK_, tV_>(ctx, dst); } \
+        return;                                                                                             \
+    }
+    FATTN_TURBO_PAIR(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO2_0)
+    FATTN_TURBO_PAIR(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO3_0)
+    FATTN_TURBO_PAIR(GGML_TYPE_Q8_0,     GGML_TYPE_TURBO4_0)
+    FATTN_TURBO_PAIR(GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0)
+    FATTN_TURBO_PAIR(GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0)
+    FATTN_TURBO_PAIR(GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0)
+#undef FATTN_TURBO_PAIR
+
+    GGML_ABORT("unsupported TurboQuant KV pair");
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -143,6 +207,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
             break;
         case 128:
             GGML_ASSERT(V->ne[0] == 128);
+            if (Q->ne[1] <= 8 && ggml_cuda_turbo_fa_mode() >= 1 && ggml_cuda_fattn_mma_turbo_supported(K, V)) {
+                ggml_cuda_flash_attn_ext_mma_turbo(ctx, dst);
+                break;
+            }
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
                 if (K->type == GGML_TYPE_Q4_0) {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<128, 128, GGML_TYPE_Q4_0>(ctx, dst);
@@ -171,6 +239,10 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         case 256:
             GGML_ASSERT(V->ne[0] == 256);
+            if (Q->ne[1] <= 8 && ggml_cuda_turbo_fa_mode() >= 1 && ggml_cuda_fattn_mma_turbo_supported(K, V)) {
+                ggml_cuda_flash_attn_ext_mma_turbo(ctx, dst);
+                break;
+            }
             if (ggml_cuda_fattn_mma_kv_native_supported(dst)) {
                 if (K->type == GGML_TYPE_Q4_0) {
                     ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2<256, 256, GGML_TYPE_Q4_0>(ctx, dst);
@@ -281,6 +353,30 @@ typedef void (* fattn_vec_case_t)(ggml_backend_cuda_context & ctx, ggml_tensor *
 
 // Vector kernel for the given head size and K/V types, nullptr if its template instance was not compiled:
 static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, const ggml_type type_K, const ggml_type type_V) {
+    if (type_K == GGML_TYPE_TURBO2_0 && type_V == GGML_TYPE_TURBO2_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0>; }
+    }
+    if (type_K == GGML_TYPE_TURBO3_0 && type_V == GGML_TYPE_TURBO3_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0>; }
+    }
+    if (type_K == GGML_TYPE_TURBO4_0 && type_V == GGML_TYPE_TURBO4_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0>; }
+    }
+    if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO2_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0>; }
+    }
+    if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO3_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0>; }
+    }
+    if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_TURBO4_0) {
+        if (head_size == 128) { return ggml_cuda_flash_attn_ext_vec_case<128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>; }
+        if (head_size == 256) { return ggml_cuda_flash_attn_ext_vec_case<256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0>; }
+    }
     FATTN_VEC_CASES_ALL_D(F16,  F16)
     FATTN_VEC_CASES_ALL_D(Q4_0, F16)
     FATTN_VEC_CASES_ALL_D(Q4_1, F16)
@@ -379,11 +475,19 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_TURBO2_0:
+        case GGML_TYPE_TURBO3_0:
+        case GGML_TYPE_TURBO4_0:
             return true;
         default:
             return false;
     }
 }
+
+static bool ggml_cuda_fattn_is_turbo(const ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
+
 
 static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef FLASH_ATTN_AVAILABLE
@@ -477,9 +581,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_NONE;
     }
 
+    const bool turbo_kv = ggml_cuda_fattn_is_turbo(K->type) || ggml_cuda_fattn_is_turbo(V->type);
+    // TurboQuant: prefer the native MMA path; the vector kernel is the fallback for shapes it does not cover.
+    if (turbo_kv && GGML_CUDA_CC_IS_NVIDIA(cc) && Q->ne[1] == 1 &&
+            K->ne[1] % FATTN_KQ_STRIDE == 0 && ggml_cuda_turbo_fa_mode() == 2 &&
+            !ggml_cuda_fattn_mma_turbo_supported(K, V) &&
+            ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) != nullptr) {
+        return BEST_FATTN_KERNEL_VEC;
+    }
+
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
-    const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    const bool can_use_vector_kernel = !turbo_kv && Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {

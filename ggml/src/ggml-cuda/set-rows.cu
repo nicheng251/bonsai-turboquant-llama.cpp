@@ -1,5 +1,158 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo-quant.cuh"
+
+// One on-disk KV block is one 128-element rotation group.
+static_assert(QK_TURBO2 == 128 && QK_TURBO3 == 128 && QK_TURBO4 == 128,
+              "TurboQuant SET_ROWS requires 128-element blocks");
+
+template <typename block_t> struct turbo_kv_codec;
+
+template <> struct turbo_kv_codec<block_turbo2_0> {
+    static __device__ uint8_t index(float v) { return turbo_nearest_centroid_2bit(v); }
+    static __device__ float centroid(uint8_t i) { return TURBO_CENTROIDS_2BIT[i]; }
+    static __device__ void pack(block_turbo2_0 * dst, const uint8_t * idx, int j) {
+        if (j % 4 == 0) {
+            dst->qs[j / 4] = idx[j] | (idx[j + 1] << 2) | (idx[j + 2] << 4) | (idx[j + 3] << 6);
+        }
+    }
+};
+
+template <> struct turbo_kv_codec<block_turbo3_0> {
+    static __device__ uint8_t index(float v) { return turbo_nearest_centroid_3bit(v); }
+    static __device__ float centroid(uint8_t i) { return TURBO_CENTROIDS_3BIT[i]; }
+    static __device__ void pack(block_turbo3_0 * dst, const uint8_t * idx, int j) {
+        if (j % 4 == 0) {
+            dst->qs[j / 4] = (idx[j] & 3) | ((idx[j + 1] & 3) << 2) |
+                            ((idx[j + 2] & 3) << 4) | ((idx[j + 3] & 3) << 6);
+        }
+        if (j % 8 == 0) {
+            uint8_t signs = 0;
+            for (int k = 0; k < 8; ++k) {
+                signs |= ((idx[j + k] >> 2) & 1) << k;
+            }
+            dst->signs[j / 8] = signs;
+        }
+    }
+};
+
+#if TURBO4_USE_4BIT
+template <> struct turbo_kv_codec<block_turbo4_0> {
+    static __device__ uint8_t index(float v) { return turbo_nearest_centroid_4bit(v); }
+    static __device__ float centroid(uint8_t i) { return TURBO_CENTROIDS_4BIT[i]; }
+    static __device__ void pack(block_turbo4_0 * dst, const uint8_t * idx, int j) {
+        if (j % 2 == 0) {
+            dst->qs[j / 2] = idx[j] | (idx[j + 1] << 4);
+        }
+    }
+};
+#endif
+
+template <typename src_t, typename idx_t, typename block_t>
+static __global__ void k_set_rows_turbo(
+        const src_t * src, const idx_t * indices, char * dst,
+        int64_t blocks_per_row, int64_t ne01, int64_t ne02, int64_t ne11, int64_t ne12,
+        size_t nb01, size_t nb02, size_t nb03, size_t nb10, size_t nb11, size_t nb12,
+        size_t nb1, size_t nb2, size_t nb3) {
+    ggml_cuda_pdl_sync();
+    const int j = threadIdx.x;
+    int64_t row = blockIdx.x / blocks_per_row;
+    const int64_t b = blockIdx.x % blocks_per_row;
+    const int64_t i01 = row % ne01;
+    row /= ne01;
+    const int64_t i02 = row % ne02;
+    const int64_t i03 = row / ne02;
+    const int64_t dst_row = *(const idx_t *) ((const char *) indices +
+            i01 * nb10 + (i02 % ne11) * nb11 + (i03 % ne12) * nb12);
+    const src_t * src_row = (const src_t *) ((const char *) src + i01 * nb01 + i02 * nb02 + i03 * nb03);
+    block_t * out = (block_t *) (dst + dst_row * nb1 + i02 * nb2 + i03 * nb3) + b;
+
+    __shared__ float x[128];
+    __shared__ uint8_t idx[128];
+    __shared__ float norm;
+    __shared__ float inv_norm;
+    x[j] = ggml_cuda_cast<float>(src_row[b * 128 + j]);
+    __syncthreads();
+    if (j == 0) {
+        float sum = 0.0f;
+        for (int k = 0; k < 128; ++k) { sum += x[k] * x[k]; }
+        norm = sqrtf(sum);
+        inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+    }
+    __syncthreads();
+    x[j] = (x[j] * inv_norm) * TURBO_WHT_SIGNS1[j];
+    __syncthreads();
+
+    // All threads read a stage before any thread writes the next stage.
+    for (int h = 1; h < 128; h <<= 1) {
+        const float a = x[j & ~h];
+        const float b = x[j | h];
+        __syncthreads();
+        x[j] = (j & h) ? a - b : a + b;
+        __syncthreads();
+    }
+    idx[j] = turbo_kv_codec<block_t>::index(x[j] * (0.08838834764831845f * TURBO_WHT_SIGNS2[j]));
+    __syncthreads();
+    turbo_kv_codec<block_t>::pack(out, idx, j);
+    if (j == 0) {
+        float recon_sq = 0.0f;
+        for (int k = 0; k < 128; ++k) {
+            const float c = turbo_kv_codec<block_t>::centroid(idx[k]);
+            recon_sq += c * c;
+        }
+        const float recon_norm = sqrtf(recon_sq);
+        out->norm = __float2half(recon_norm > 1e-10f ? norm / recon_norm : norm);
+    }
+}
+
+template <typename src_t, typename idx_t, typename block_t>
+static void set_rows_cuda_turbo(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src, const ggml_tensor * indices, ggml_tensor * dst) {
+    GGML_ASSERT(ggml_cuda_supports_turbo_set_rows(dst));
+    const int64_t blocks_per_row = src->ne[0] / 128;
+    const int64_t n_blocks = blocks_per_row * src->ne[1] * src->ne[2] * src->ne[3];
+    if (n_blocks == 0) { return; }
+    k_set_rows_turbo<src_t, idx_t, block_t><<<n_blocks, 128, 0, ctx.stream()>>>(
+        (const src_t *) src->data, (const idx_t *) indices->data, (char *) dst->data,
+        blocks_per_row, src->ne[1], src->ne[2], indices->ne[1], indices->ne[2],
+        src->nb[1], src->nb[2], src->nb[3], indices->nb[0], indices->nb[1], indices->nb[2],
+        dst->nb[1], dst->nb[2], dst->nb[3]);
+}
+
+template <typename src_t, typename idx_t>
+static void set_rows_cuda_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    switch (dst->type) {
+        case GGML_TYPE_TURBO2_0:
+            set_rows_cuda_turbo<src_t, idx_t, block_turbo2_0>(ctx, dst->src[0], dst->src[1], dst);
+            break;
+        case GGML_TYPE_TURBO3_0:
+            set_rows_cuda_turbo<src_t, idx_t, block_turbo3_0>(ctx, dst->src[0], dst->src[1], dst);
+            break;
+#if TURBO4_USE_4BIT
+        case GGML_TYPE_TURBO4_0:
+            set_rows_cuda_turbo<src_t, idx_t, block_turbo4_0>(ctx, dst->src[0], dst->src[1], dst);
+            break;
+#endif
+        default: GGML_ABORT("unsupported TurboQuant SET_ROWS type");
+    }
+}
+
+bool ggml_cuda_supports_turbo_set_rows(const ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    const ggml_tensor * idx = dst->src[1];
+    const int group_size = ggml_get_op_params_i32(dst, 0);
+    return src && idx &&
+        (src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16) &&
+        (idx->type == GGML_TYPE_I32 || idx->type == GGML_TYPE_I64) &&
+        src->nb[0] == ggml_type_size(src->type) && src->ne[0] % 128 == 0 &&
+        idx->ne[1] > 0 && idx->ne[2] > 0 &&
+        (group_size == 0 || group_size == 128) &&
+        (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0
+#if TURBO4_USE_4BIT
+         || dst->type == GGML_TYPE_TURBO4_0
+#endif
+        );
+}
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -376,6 +529,24 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
 void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+
+    if (dst->type == GGML_TYPE_TURBO2_0 || dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO4_0) {
+        GGML_ASSERT(ggml_cuda_supports_turbo_set_rows(dst));
+        if (src0->type == GGML_TYPE_F32) {
+            if (src1->type == GGML_TYPE_I64) {
+                set_rows_cuda_turbo<float, int64_t>(ctx, dst);
+            } else {
+                set_rows_cuda_turbo<float, int32_t>(ctx, dst);
+            }
+        } else {
+            if (src1->type == GGML_TYPE_I64) {
+                set_rows_cuda_turbo<half, int64_t>(ctx, dst);
+            } else {
+                set_rows_cuda_turbo<half, int32_t>(ctx, dst);
+            }
+        }
+        return;
+    }
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);

@@ -83,9 +83,12 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #endif // GGML_USE_HIP
 
+    constexpr bool K_is_turbo = type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0;
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
-    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
-    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_V_q;
+    constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16 || K_is_turbo) ? 128 / cpy_nb : nthreads_KQ_q;
+    constexpr bool V_is_turbo = type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0;
+    constexpr int nthreads_V  = (type_V == GGML_TYPE_F16 || type_V == GGML_TYPE_BF16) ? 128 / cpy_nb :
+                               (V_is_turbo ? (nthreads_V_q / 8 < 1 ? 1 : nthreads_V_q / 8) : nthreads_V_q);
 
     static_assert(WARP_SIZE % nthreads_KQ == 0, "bad nthreads_K");
     static_assert(WARP_SIZE % nthreads_V  == 0, "bad nthreads_V");
@@ -94,7 +97,7 @@ static __global__ void flash_attn_ext_vec(
     constexpr int V_cols_per_iter   = WARP_SIZE / nthreads_V;
 
     constexpr vec_dot_KQ_t vec_dot_KQ = get_vec_dot_KQ<type_K, D, nthreads_KQ>();
-    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16;
+    constexpr bool Q_q8_1 = type_K != GGML_TYPE_F16 && type_K != GGML_TYPE_BF16 && !K_is_turbo;
 #ifdef V_DOT2_F32_F16_AVAILABLE
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
@@ -551,8 +554,31 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    if (Q->ne[1] == 1) {
-        constexpr int cols_per_block = 1;
+    constexpr bool has_turbo = type_K == GGML_TYPE_TURBO2_0 || type_K == GGML_TYPE_TURBO3_0 || type_K == GGML_TYPE_TURBO4_0 ||
+                               type_V == GGML_TYPE_TURBO2_0 || type_V == GGML_TYPE_TURBO3_0 || type_V == GGML_TYPE_TURBO4_0;
+    if constexpr (has_turbo) {
+        // Start with one-query decode; do not instantiate the two-column Turbo path.
+        static_assert(D == 128 || D == 256, "unsupported TurboQuant head size");
+        GGML_ASSERT(Q->ne[1] == 1);
+        if (logit_softcap == 0.0f) {
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, false>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_vec_case_impl<D, 1, type_K, type_V, true>(ctx, dst);
+        }
+    } else {
+        if (Q->ne[1] == 1) {
+            constexpr int cols_per_block = 1;
+            if (logit_softcap == 0.0f) {
+                constexpr bool use_logit_softcap = false;
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            } else {
+                constexpr bool use_logit_softcap = true;
+                ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
+            }
+            return;
+        }
+
+        constexpr int cols_per_block = 2;
         if (logit_softcap == 0.0f) {
             constexpr bool use_logit_softcap = false;
             ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
@@ -560,16 +586,6 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
             constexpr bool use_logit_softcap = true;
             ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
         }
-        return;
-    }
-
-    constexpr int cols_per_block = 2;
-    if (logit_softcap == 0.0f) {
-        constexpr bool use_logit_softcap = false;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
-    } else {
-        constexpr bool use_logit_softcap = true;
-        ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap>(ctx, dst);
     }
 }
 
@@ -609,3 +625,17 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// Native single-query TurboQuant decode instances.
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO2_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0);

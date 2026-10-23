@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "convert.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -456,6 +457,33 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
 
     char * src0_ddc = (char *) src0->data;
     char * src1_ddc = (char *) src1->data;
+
+    const bool turbo_src = src0->type == GGML_TYPE_TURBO2_0 || src0->type == GGML_TYPE_TURBO3_0 || src0->type == GGML_TYPE_TURBO4_0;
+    const bool tq_src = src0->type == GGML_TYPE_TQ3_1S || src0->type == GGML_TYPE_TQ4_1S;
+    if ((turbo_src || tq_src) && src1->type == GGML_TYPE_F32) {
+        const auto convert = ggml_get_to_fp32_nc_cuda(src0->type);
+        GGML_ASSERT(convert != nullptr);
+        const size_t type_size = ggml_type_size(src0->type);
+        GGML_ASSERT(src0->nb[0] == type_size);
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool());
+        float * out = (float *) src1->data;
+        if (!ggml_is_contiguous(src1)) {
+            out = scratch.alloc(ne);
+        }
+        convert(src0->data, out, ne00, ne01, ne02, src0->ne[3],
+                nb01 / type_size, nb02 / type_size, nb03 / type_size, main_stream);
+        if (!ggml_is_contiguous(src1)) {
+            ggml_tensor tmp = *src0;
+            tmp.type = GGML_TYPE_F32;
+            tmp.data = out;
+            tmp.nb[0] = sizeof(float);
+            for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+                tmp.nb[i] = tmp.nb[i - 1] * tmp.ne[i - 1];
+            }
+            ggml_cuda_cpy(ctx, &tmp, src1);
+        }
+        return;
+    }
 
     const bool contiguous_srcs = ggml_is_contiguous(src0) && ggml_is_contiguous(src1);
     const bool can_be_transposed = nb01 == (int64_t)ggml_element_size(src0) &&

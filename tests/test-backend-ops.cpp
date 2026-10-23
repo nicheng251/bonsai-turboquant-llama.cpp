@@ -9622,6 +9622,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 67, 32, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
     }
 
+    // TQ4 decode geometries outside the contiguous 2D fast path.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 67, 4, 1536, {2, 2}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 67, 4, 1536, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1600));
+
+    // ConvRot decode and prefill with multiple rotation groups and a partial row tile.
+    for (ggml_type type : {GGML_TYPE_Q8_CR, GGML_TYPE_Q5_CR, GGML_TYPE_Q6_CR}) {
+        for (int64_t n : {1, 32}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 67, n, 768, {1, 1}, {1, 1}));
+        }
+    }
+
     // PTQ1_0 / PQ2_0 integer-dot mat-vec: Bonsai-2 shapes, odd row counts (row tail), batches and multi-column B
     for (int64_t n : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (int64_t k : {1024, 5120, 6144, 17408}) {
@@ -10462,13 +10473,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // Turbo KV flash attention: aligned heads, decode and prefill, and GQA.
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ4_1S, GGML_TYPE_F32, 4, 2, true, 67, 4, 1536));
+
+    // Turbo KV flash attention: Bonsai GQA6 decode and FP16-staged prefill.
     for (ggml_type type : {GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO4_0}) {
         for (int head_dim : {128, 256}) {
-            for (int nb : {1, 32}) {
-                test_cases.emplace_back(new test_flash_attn_ext(head_dim, head_dim, 2, {2, 1}, 256, nb,
-                    true, false, 0, 0, GGML_PREC_F32, type, type));
-            }
+            test_cases.emplace_back(new test_flash_attn_ext(head_dim, head_dim, 4, {6, 1}, 256, 1,
+                true, false, 0, 0, GGML_PREC_F32, type, type));
+            test_cases.emplace_back(new test_flash_attn_ext(head_dim, head_dim, 4, {6, 1}, 256, 1,
+                true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, type));
+            test_cases.emplace_back(new test_flash_attn_ext(head_dim, head_dim, 2, {2, 1}, 256, 32,
+                true, false, 0, 0, GGML_PREC_F32, type, type));
         }
         // Unequal K/V head sizes and types exercise separate dequant strides.
         test_cases.emplace_back(new test_flash_attn_ext(256, 128, 2, {2, 1}, 256, 3,
@@ -10478,6 +10493,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 128, 2, {2, 1}, 256, 32,
         true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO4_0, {0, 2, 1, 3}));
+
+    // Long-cache decode also exercises the split reduction.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 16384, 1,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO3_0, GGML_TYPE_TURBO3_0));
+
+    // Decode edge cases: cache strides, tail rows, and attention options.
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 256, 1,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO2_0, GGML_TYPE_TURBO2_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 256, 1,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 257, 1,
+        true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {6, 1}, 256, 1,
+        false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_TURBO4_0, GGML_TYPE_TURBO4_0));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 2}, 256, 1,
+        true, true, 8.0f, 30.0f, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_TURBO3_0));
 
     // mixed quant and Q1_0 test cases
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 128, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));

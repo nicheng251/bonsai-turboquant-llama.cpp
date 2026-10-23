@@ -9,7 +9,7 @@
 > The base history is Prism's `prism` (which itself tracks mainline llama.cpp); TurboQuant's features are ported on top.
 > **Goal:** run Bonsai models *and* use TurboQuant from a single build.
 >
-> **Implemented on this branch (CPU + Vulkan):**
+> **Implemented on this branch (CPU + Vulkan + CUDA):**
 >
 > - Bonsai ternary weights — `PQ2_0` (ggml id 142), `PTQ1_0` (id 143), plus upstream `Q2_0` (42) / `Q1_0` (41), and the `prism.hadamard.*` weight-fold graph.
 > - TurboQuant KV cache — `turbo2` / `turbo3` / `turbo4` (ggml ids 43 / 44 / 47, runtime-only):
@@ -17,7 +17,24 @@
 > - TurboQuant weights — `TQ3_1S` (45), `TQ4_1S` (46); ConvRot weights `Q8_CR` (48), `Q5_CR` (49), `Q6_CR` (50).
 > - `GGML_OP_TURBO_WHT` (Walsh–Hadamard rotation) and the TurboQuant codec (`ggml-turbo-quant.c`).
 >
-> **Backend coverage:** CPU ✅ · Vulkan ✅ · CUDA / Metal / SYCL ❌ (not ported yet — those backends reject the TurboQuant types and fall back to CPU).
+> **Backend coverage:** CPU and Vulkan are implemented and tested. CUDA first-pass support builds with CUDA 13.2 / MSVC 19.51 and passes focused backend tests on an RTX 4060 Laptop GPU, plus a short Bonsai PTQ1_0 + TurboQuant KV generation smoke test. Metal / SYCL TurboQuant kernels are not ported.
+>
+> On high-GQA models, the default auto-asymmetric policy may upgrade a requested Turbo K cache to `q8_0`. Inspect the startup log for the actual K/V types. `TURBO_AUTO_ASYMMETRIC=0` disables this policy; it was used only for the symmetric Turbo KV smoke tests, not as a quality recommendation.
+>
+> **CUDA native low-bit attention (default):** TurboQuant KV is dequantized straight into the MMA shared-memory tiles, so the tensor-core FlashAttention kernel reads the low-bit cache in place. No FP16 copy of K/V is written for decode. Supported: NVIDIA, head size 128 or 256, query count up to 8, and K/V pairs `q8_0` + `turbo2/3/4`, `turbo2/turbo2`, `turbo3/turbo3`, `turbo4/turbo4`. Prefill still converts to FP16. `GGML_CUDA_TURBO_FA=0` forces the old conversion path; `=1` also enables the native vector fallback for shapes the MMA path does not cover.
+>
+> Measured on an RTX 4060 Laptop with the 27B Bonsai PTQ1_0 model and `q8_0` K + `turbo3` V:
+>
+> | context | FP16 conversion | native low-bit |
+> |---|---|---|
+> | 2.0K | 29.7 tok/s | **30.3 tok/s** |
+> | 17.4K | 23.6 tok/s | **29.6 tok/s** (+25%) |
+>
+> For comparison at 17.4K, F16 KV gives 29.2 tok/s and `q8_0/q8_0` KV gives 27.1 tok/s, so the low-bit path is now the fastest of the three while using the smallest cache (614 MiB vs 1429 MiB context buffer). Prefill is unaffected: attention is under 2% of prefill time even at 17K, so prefill keeps converting.
+>
+> **CUDA limits:** Prefill and query counts above 8 still take a transient FP16 conversion before CUDA FlashAttention. Head sizes other than 128/256, non-NVIDIA devices, or other K/V pairs fall back to the conversion path; unsupported head geometries fall back to CPU. TQ3 weights use dequantization + cuBLAS; eligible small-batch TQ4 weights use a fused decode path. Bonsai's existing CUDA weight kernels are preserved.
+>
+> **Known stock issue:** the full CUDA `q8_0/q8_0` FlashAttention sweep in `test-backend-ops` aborts with an illegal memory access after several hundred cases, at a case that passes in isolation. No TurboQuant type is involved. Upstream #30103 (a missing barrier in the MMA combine loop) is included, but does not resolve it.
 >
 > **Model files (Bonsai):**
 > - `*-PQ2_0.gguf` (group-128, id 142) — preferred here.

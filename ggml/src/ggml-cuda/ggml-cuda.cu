@@ -18,6 +18,7 @@
 #include "ggml-cuda/conv2d-dw.cuh"
 #include "ggml-cuda/conv2d-transpose.cuh"
 #include "ggml-cuda/convert.cuh"
+#include "ggml-cuda/convrot.cuh"
 #include "ggml-cuda/count-equal.cuh"
 #include "ggml-cuda/cpy.cuh"
 #include "ggml-cuda/cross-entropy-loss.cuh"
@@ -32,6 +33,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-tq.cuh"
 #include "ggml-cuda/moe-reduce.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -52,6 +54,7 @@
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
+#include "ggml-cuda/turbo-wht.cuh"
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
@@ -92,6 +95,18 @@
 #include <vector>
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
+
+static bool ggml_cuda_is_tq_weight(ggml_type type) {
+    return type == GGML_TYPE_TQ3_1S || type == GGML_TYPE_TQ4_1S;
+}
+
+static bool ggml_cuda_is_cr_weight(ggml_type type) {
+    return type == GGML_TYPE_Q8_CR || type == GGML_TYPE_Q5_CR || type == GGML_TYPE_Q6_CR;
+}
+
+static bool ggml_cuda_is_turbo_kv(ggml_type type) {
+    return type == GGML_TYPE_TURBO2_0 || type == GGML_TYPE_TURBO3_0 || type == GGML_TYPE_TURBO4_0;
+}
 
 #define GGML_LOG_WARN_ONCE(str) \
     { static std::once_flag warn_flag; std::call_once(warn_flag, []() { GGML_LOG_WARN(str); }); }
@@ -1740,6 +1755,10 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
         return false;
     }
 
+    if (ggml_cuda_is_tq_weight(ffn_up->src[0]->type) || ggml_cuda_is_cr_weight(ffn_up->src[0]->type)) {
+        return false;
+    }
+
     if (ffn_up->src[1] != ffn_gate->src[1]) {
         return false;
     }
@@ -1797,8 +1816,9 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
                                    src0->view_src;
 
-    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+    bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear &&
+                             !ggml_cuda_is_tq_weight(src0->type) && !ggml_cuda_is_cr_weight(src0->type) &&
+                             src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1819,7 +1839,32 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 bool ggml_cuda_mul_mat_q1_hopper(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_in, const ggml_tensor * src1_in, ggml_tensor * dst) {
+    ggml_cuda_pool_alloc<float> rotated_activation(ctx.pool());
+    ggml_tensor rotated_src1;
+    ggml_tensor unrotated_type_src0;
+    const ggml_tensor * src0 = src0_in;
+    const ggml_tensor * src1 = src1_in;
+
+    if (ggml_cuda_is_cr_weight(src0->type)) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(src1) && src1->ne[0] % QK8_CR == 0);
+        rotated_activation.alloc(ggml_nelements(src1));
+        ggml_cuda_convrot_rotate(ctx, src1, rotated_activation.get());
+        rotated_src1 = *src1;
+        rotated_src1.data = rotated_activation.get();
+        unrotated_type_src0 = *src0;
+        switch (src0->type) {
+            case GGML_TYPE_Q8_CR: unrotated_type_src0.type = GGML_TYPE_Q8_0; break;
+            case GGML_TYPE_Q5_CR: unrotated_type_src0.type = GGML_TYPE_Q5_0; break;
+            case GGML_TYPE_Q6_CR: unrotated_type_src0.type = GGML_TYPE_Q6_K; break;
+            default: GGML_ABORT("unsupported ConvRot type");
+        }
+        unrotated_type_src0.nb[0] = ggml_type_size(unrotated_type_src0.type);
+        src0 = &unrotated_type_src0;
+        src1 = &rotated_src1;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
@@ -1834,6 +1879,15 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        return;
+    }
+
+    if (ggml_cuda_is_tq_weight(src0->type)) {
+        if (ggml_cuda_tq_fast_path(src0, src1, nullptr, dst)) {
+            ggml_cuda_mul_mat_tq(ctx, src0, src1, dst);
+        } else {
+            ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+        }
         return;
     }
 
@@ -1887,6 +1941,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_cuda_is_tq_weight(src0->type)) {
+        return !ggml_cuda_tq_fast_path(src0, src1, dst->src[2], dst);
+    }
+
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
     }
@@ -1924,8 +1982,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    const bool is_tq_weight = ggml_cuda_is_tq_weight(src0->type);
+    if (ggml_cuda_tq_fast_path(src0, src1, ids, dst)) {
+        ggml_cuda_mul_mat_id_tq(ctx, src0, src1, ids, dst);
+        return;
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+    if (!is_tq_weight && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
@@ -2091,6 +2155,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            break;
+        case GGML_OP_TURBO_WHT:
+            ggml_cuda_turbo_wht(ctx, dst);
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -5636,6 +5703,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     !(is_hadamard && a->type == GGML_TYPE_F32)) {
                     return false;
                 }
+                if (ggml_cuda_is_cr_weight(a->type)) {
+#ifdef GGML_USE_MUSA
+                    return false;
+#endif
+                    return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(b) && ggml_is_contiguous(op) && b->ne[0] % QK8_CR == 0;
+                }
 #ifdef GGML_USE_MUSA
                 const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
                 if (b->ne[2]*b->ne[3] > 1 && !ggml_is_transposed(a) && !ggml_is_transposed(b)) {
@@ -5679,6 +5753,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_TQ4_1S:
                         return true;
                     default:
                         return false;
@@ -5688,6 +5764,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
         case GGML_OP_GET_ROWS:
             {
+                if (ggml_cuda_is_turbo_kv(op->src[0]->type) || ggml_cuda_is_cr_weight(op->src[0]->type)) {
+                    return op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
+                }
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F16:
                     case GGML_TYPE_F32:
@@ -5715,6 +5794,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ1_S:
                     case GGML_TYPE_IQ1_M:
                     case GGML_TYPE_IQ4_XS:
+                    case GGML_TYPE_TQ3_1S:
+                    case GGML_TYPE_TQ4_1S:
                         return true;
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
@@ -5731,6 +5812,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_SET_ROWS:
             {
+                if (ggml_cuda_is_turbo_kv(op->type)) {
+                    return ggml_cuda_supports_turbo_set_rows(op);
+                }
                 return (
                            (
                                (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_BF16 ||
@@ -5758,6 +5842,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     (src1_type == GGML_TYPE_F32 || src1_type == GGML_TYPE_BF16 || src1_type == GGML_TYPE_F16)
                 ) {
                     return true;
+                }
+                if ((ggml_cuda_is_turbo_kv(src0_type) || ggml_cuda_is_tq_weight(src0_type)) && src1_type == GGML_TYPE_F32) {
+                    return op->src[0]->nb[0] == ggml_type_size(src0_type);
                 }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q8_0) {
                     return true;
@@ -5901,6 +5988,17 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_CLAMP:
         case GGML_OP_LOG:
             return true;
+        case GGML_OP_TURBO_WHT: {
+            const ggml_tensor * src = op->src[0];
+            const ggml_tensor * scale = op->src[1];
+            const int direction = ggml_get_op_params_i32(op, 0);
+            const int group = ggml_get_op_params_i32(op, 1);
+            return src->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(src) && ggml_is_contiguous(op) &&
+                   (direction == 0 || direction == 1) && (group == 32 || group == 64 || group == 128) &&
+                   src->ne[0] % group == 0 &&
+                   (!scale || (scale->type == GGML_TYPE_F32 && ggml_is_contiguous(scale) && ggml_nelements(scale) >= group));
+        }
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
