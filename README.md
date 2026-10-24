@@ -34,7 +34,7 @@
 >
 > **CUDA limits:** Prefill and query counts above 8 still take a transient FP16 conversion before CUDA FlashAttention. Head sizes other than 128/256, non-NVIDIA devices, or other K/V pairs fall back to the conversion path; unsupported head geometries fall back to CPU. TQ3 weights use dequantization + cuBLAS; eligible small-batch TQ4 weights use a fused decode path. Bonsai's existing CUDA weight kernels are preserved.
 >
-> **Known stock issue:** the full CUDA `q8_0/q8_0` FlashAttention sweep in `test-backend-ops` aborts with an illegal memory access after several hundred cases, at a case that passes in isolation. No TurboQuant type is involved. Upstream #30103 (a missing barrier in the MMA combine loop) is included, but does not resolve it.
+> **Fixed locally:** the full CUDA `q8_0/q8_0` FlashAttention sweep in `test-backend-ops` used to abort with an illegal memory access after several hundred cases. The 3-4 query row shortcut in `switch_ncols1` dropped the K/V type template arguments, so a quantized cache was converted to F16 even though the allocator had sized the tensor for the in-place kernel; the conversion then wrote up to 4 MiB past the buffer. The branch keeps its types now. `q8_0/q8_0` passes 390/390 and `q4_0/q4_0` 377/377.
 >
 > **Model files (Bonsai):**
 > - `*-PQ2_0.gguf` (group-128, id 142) — preferred here.

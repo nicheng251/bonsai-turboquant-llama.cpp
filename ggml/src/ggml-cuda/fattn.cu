@@ -41,7 +41,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     }
 
     if (turing_mma_available(cc) && ggml_is_quantized(V->type) && Q->ne[1] > 2 && Q->ne[1] <= 4) {
-        ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        // Wide tile for 3-4 query rows. The native q4_0/q8_0 kernel must keep its types here: converting to
+        // F16 needs scratch that ggml_cuda_flash_attn_ext_get_alloc_size did not reserve (it skips the scratch
+        // when the native kernel is available), which overruns the tensor buffer.
+        if constexpr (ggml_cuda_fattn_mma_kv_native(type_KV) && type_KV == type_V) {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2, type_KV, type_V>(ctx, dst);
+        } else {
+            ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 64/ncols2, ncols2>(ctx, dst);
+        }
         return;
     }
 
