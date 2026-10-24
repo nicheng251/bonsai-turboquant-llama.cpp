@@ -1,0 +1,89 @@
+name: fork-cpu-tests
+
+on:
+  push:
+    branches: [ integrate/bonsai-turboquant ]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 0"
+
+concurrency:
+  group: fork-cpu-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  type-ids:
+    name: ggml_type id allocation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for collisions with upstream ids
+        run: python3 scripts/check-ggml-type-ids.py
+
+  linux-cpu:
+    name: Linux CPU build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --target test-turbo-quant test-gguf test-backend-ops -j "$(nproc)"
+
+      - name: TurboQuant codec and WHT round-trip
+        run: ./build/bin/test-turbo-quant
+
+      - name: GGUF reader and legacy layout guard
+        run: ./build/bin/test-gguf
+
+      - name: TurboQuant and ConvRot weight matmuls (CPU)
+        run: ./build/bin/test-backend-ops -b CPU -o MUL_MAT -p tq
+
+      - name: Flash attention with small KV (CPU)
+        run: ./build/bin/test-backend-ops -b CPU -o FLASH_ATTN_EXT -p "kv=113"
+
+  windows-cpu:
+    name: Windows CPU build
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF
+          -DLLAMA_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --target test-turbo-quant test-gguf test-backend-ops -j 4
+
+      - name: TurboQuant codec and WHT round-trip
+        run: ./build/bin/Release/test-turbo-quant.exe
+
+      - name: GGUF reader and legacy layout guard
+        run: ./build/bin/Release/test-gguf.exe
+
+  full-fa:
+    name: Full FLASH_ATTN_EXT sweep (CPU)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+
+      - name: Build test-backend-ops
+        run: cmake --build build --target test-backend-ops -j "$(nproc)"
+
+      - name: Full matrix
+        run: ./build/bin/test-backend-ops -b CPU -o FLASH_ATTN_EXT

@@ -1,6 +1,9 @@
 # Bonsai + TurboQuant integration (CPU and Vulkan)
 
-This branch uses Prism/Bonsai llama.cpp as its base and ports only the TurboQuant subsystem. CUDA, Metal and SYCL TurboQuant kernels have not been ported. Prism's PQ2_0 and PTQ1_0 weight types remain available.
+This branch uses Prism/Bonsai llama.cpp as its base and ports only the TurboQuant subsystem.
+CPU, Vulkan and CUDA are implemented; Metal and SYCL are not ported. Prism's PQ2_0 and PTQ1_0 weight
+types remain available. Type ids are documented in [turboquant-type-ids.md](turboquant-type-ids.md)
+and checked by `scripts/check-ggml-type-ids.py`.
 
 ## Supported paths
 
@@ -18,6 +21,13 @@ This branch uses Prism/Bonsai llama.cpp as its base and ports only the TurboQuan
 - Context shifting is disabled when the actual K cache is Turbo. A Turbo K cache cannot safely receive ordinary RoPE shifts in its WHT basis. Auto-asymmetric Q8_0 K keeps its existing shift capability.
 - State files require matching cache types, layout and attention-rotation settings. Do not change `LLAMA_ATTN_ROT_DISABLE` when restoring an existing cache state.
 - CUDA InnerQ calibration and layer-adaptive cache policies are not included.
+
+## Type ids
+
+The fork's private types use explicit ids (43-50, 142, 143). Upstream grows its enum
+sequentially, so a new upstream type can land on id 43. `scripts/check-ggml-type-ids.py`
+fails on that, and [turboquant-type-ids.md](turboquant-type-ids.md) records the current
+mapping and the renumbering procedure.
 
 ## Build
 
