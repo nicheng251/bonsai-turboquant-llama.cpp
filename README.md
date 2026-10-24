@@ -30,11 +30,16 @@
 > | 2.0K | 29.7 tok/s | **30.3 tok/s** |
 > | 17.4K | 23.6 tok/s | **29.6 tok/s** (+25%) |
 >
-> For comparison at 17.4K, F16 KV gives 29.2 tok/s and `q8_0/q8_0` KV gives 27.1 tok/s, so the low-bit path is now the fastest of the three while using the smallest cache (614 MiB vs 1429 MiB context buffer). Prefill is unaffected: attention is under 2% of prefill time even at 17K, so prefill keeps converting.
+> For comparison at 17.4K, F16 KV gives 29.2 tok/s and `q8_0/q8_0` KV gives 29.6 tok/s with the in-place MMA kernel (27.1 tok/s before it was enabled for GQA above 4 on Ada); TurboQuant matches that speed using the smallest cache (614 MiB vs 1429 MiB context buffer). Prefill is unaffected: attention is under 2% of prefill time even at 17K, so prefill keeps converting.
+>
+> **Prism tracking:** based on Prism `prism` at `e8fd209c9`, with selected later Prism fixes carried over: the
+> short-query quantized-K/V FA fix and its tests, the CPU repack null-trait crash fix, the legacy Q2_0 gguf guard,
+> the Ada GQA>4 in-place MMA rule, and the PQ2_0/PTQ1_0 Hadamard-metadata check. The repository's `prism` branch is
+> kept in sync with Prism's `prism` for reference.
 >
 > **CUDA limits:** Prefill and query counts above 8 still take a transient FP16 conversion before CUDA FlashAttention. Head sizes other than 128/256, non-NVIDIA devices, or other K/V pairs fall back to the conversion path; unsupported head geometries fall back to CPU. TQ3 weights use dequantization + cuBLAS; eligible small-batch TQ4 weights use a fused decode path. Bonsai's existing CUDA weight kernels are preserved.
 >
-> **Fixed locally:** the full CUDA `q8_0/q8_0` FlashAttention sweep in `test-backend-ops` used to abort with an illegal memory access after several hundred cases. The 3-4 query row shortcut in `switch_ncols1` dropped the K/V type template arguments, so a quantized cache was converted to F16 even though the allocator had sized the tensor for the in-place kernel; the conversion then wrote up to 4 MiB past the buffer. The branch keeps its types now. `q8_0/q8_0` passes 390/390 and `q4_0/q4_0` 377/377.
+> **Fixed locally:** the full CUDA `q8_0/q8_0` FlashAttention sweep in `test-backend-ops` used to abort with an illegal memory access after several hundred cases. The 3-4 query row shortcut in `switch_ncols1` dropped the K/V type template arguments, so a quantized cache was converted to F16 even though the allocator had sized the tensor for the in-place kernel; the conversion then wrote up to 4 MiB past the buffer. The branch keeps its types now. `q8_0/q8_0` passes 462/462 and `q4_0/q4_0` 449/449 (including the short-query cases from Prism).
 >
 > **Model files (Bonsai):**
 > - `*-PQ2_0.gguf` (group-128, id 142) — preferred here.
