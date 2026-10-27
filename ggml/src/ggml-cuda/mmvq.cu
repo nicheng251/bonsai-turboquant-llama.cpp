@@ -780,7 +780,7 @@ static __global__ void mul_mat_vec_q(
             std::conditional_t<type == GGML_TYPE_Q2_0, block_q2_0, block_pq2_0>>;
         // These packed AoS formats are scoreboard-latency bound on GB10. Prefetch one
         // K iteration ahead; only the first lane that consumes a quant block issues it.
-#pragma unroll (type == GGML_TYPE_Q2_0 ? 2 : 1)
+#pragma unroll type == GGML_TYPE_Q2_0 ? 2 : 1
         for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
             const int kby = kbx * (qk/QK8_1);
             const int kqs = vdr * (tid % (qi/vdr));
