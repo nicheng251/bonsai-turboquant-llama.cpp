@@ -14,6 +14,7 @@
 #include "llama.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
