@@ -5,8 +5,6 @@ on:
     branches: [ integrate/bonsai-turboquant ]
   pull_request:
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 * * 0"
 
 concurrency:
   group: fork-cpu-${{ github.workflow }}-${{ github.ref }}
