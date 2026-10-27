@@ -40,7 +40,7 @@ static __global__ void tq_prerotate_q8_1(
 
     #pragma unroll
     for (int h = 1; h < 32; h <<= 1) {
-        float o = __shfl_xor_sync(0xffffffff, val, h);
+        float o = __shfl_xor_sync(0xffffffff, val, h, 32);
         val = (lane & h) ? (o - val) : (val + o);
     }
     val *= 0.17677669529663688f;
@@ -48,12 +48,12 @@ static __global__ void tq_prerotate_q8_1(
     float amax = fabsf(val);
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off));
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, off, 32));
 
     float sum = val;
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
-        sum += __shfl_xor_sync(0xffffffff, sum, off);
+        sum += __shfl_xor_sync(0xffffffff, sum, off, 32);
 
     const float d = amax / 127.0f;
     const float id = (d > 0.0f) ? 127.0f / amax : 0.0f;
@@ -160,7 +160,7 @@ static __global__ void mul_mat_tq4_1s_dp4a_multi(
     for (int offset = 16; offset > 0; offset >>= 1) {
         #pragma unroll
         for (int j = 0; j < ncols_dst; j++)
-            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset);
+            sumf[j] += __shfl_xor_sync(0xffffffff, sumf[j], offset, 32);
     }
 
     if (lane == 0) {

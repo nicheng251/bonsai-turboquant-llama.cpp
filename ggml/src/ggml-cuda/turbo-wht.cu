@@ -137,10 +137,10 @@ static __global__ void k_turbo_wht_f32_fast(const float * __restrict__ src,
 
 #define WHT_SHFL_STAGE(m)                                       \
     {                                                           \
-        const float px = __shfl_xor_sync(0xffffffff, v.x, (m)); \
-        const float py = __shfl_xor_sync(0xffffffff, v.y, (m)); \
-        const float pz = __shfl_xor_sync(0xffffffff, v.z, (m)); \
-        const float pw = __shfl_xor_sync(0xffffffff, v.w, (m)); \
+        const float px = __shfl_xor_sync(0xffffffff, v.x, (m), 32); \
+        const float py = __shfl_xor_sync(0xffffffff, v.y, (m), 32); \
+        const float pz = __shfl_xor_sync(0xffffffff, v.z, (m), 32); \
+        const float pw = __shfl_xor_sync(0xffffffff, v.w, (m), 32); \
         const bool hi = (lane & (m)) != 0;                      \
         v.x = hi ? px - v.x : v.x + px;                         \
         v.y = hi ? py - v.y : v.y + py;                         \
