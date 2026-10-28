@@ -167,6 +167,13 @@ static bool ggml_cuda_fattn_mma_turbo_supported(const ggml_tensor * K, const ggm
 }
 
 static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    // The turbo MMA instances read quantized K/V in place and are built for NVIDIA only;
+    // ggml-hip filters their template-instance files out, so keep the references out too.
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    GGML_ABORT("TurboQuant K/V on the MMA path requires an NVIDIA device");
+#else
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
@@ -185,6 +192,7 @@ static void ggml_cuda_flash_attn_ext_mma_turbo(ggml_backend_cuda_context & ctx, 
 #undef FATTN_TURBO_PAIR
 
     GGML_ABORT("unsupported TurboQuant KV pair");
+#endif // defined(GGML_USE_HIP)
 }
 
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
